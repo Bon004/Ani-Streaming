@@ -11,7 +11,28 @@ external_menu() {
 
 launcher() {
     [ "$use_external_menu" = "0" ] && [ -z "$1" ] && set -- "+m" "$2"
-    [ "$use_external_menu" = "0" ] && fzf "$1" --reverse --cycle --prompt "$2"
+    if [ "$use_external_menu" = "0" ]; then
+        if [ -n "$_ani_preview_script" ]; then
+            _win_pid=""
+            if [ -n "$_ani_preview_win_script" ] && command -v powershell.exe >/dev/null 2>&1; then
+                _ps1_win="$(cygpath -w "$_ani_preview_win_script" 2>/dev/null)"
+                _watch_win="$(cygpath -w "$anilist_cache_dir/current_preview" 2>/dev/null)"
+                : > "$anilist_cache_dir/current_preview"
+                powershell.exe -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass \
+                    -File "$_ps1_win" \
+                    -WatchFile "$_watch_win" \
+                    < /dev/null > /dev/null 2>&1 &
+                _win_pid=$!
+            fi
+            fzf "$1" --reverse --cycle --prompt "$2" \
+                --preview "bash \"$_ani_preview_script\" {1}" \
+                --preview-window=right:35%:wrap
+            [ -n "$_win_pid" ] && kill "$_win_pid" 2>/dev/null
+            rm -f "$anilist_cache_dir/current_preview"
+        else
+            fzf "$1" --reverse --cycle --prompt "$2"
+        fi
+    fi
     [ "$use_external_menu" = "1" ] && external_menu "$1" "$2" "$external_menu_args"
     [ "$use_external_menu" = "2" ] && external_menu "$1" "$2"
 }
@@ -88,6 +109,17 @@ help_info() {
         Display a countdown to the next episode
       -U, --update
         Update the script
+      --anilist-login
+        Authenticate with your AniList account (required for sync)
+      --no-anilist
+        Disable AniList sync for this session
+      --manga
+        Read manga (powered by MangaDex, requires jq and chafa)
+      --diagnose
+        Run network diagnostics for a specific episode
+    Environment variables:
+      ANI_CLI_THUMBNAILS
+        Set to 0 to disable AniList thumbnail preview in search (default: 1, requires chafa)
     Some example usages:
       %s -q 720p banana fish
       %s --skip --skip-title \"one piece\" -S 2 one piece
@@ -140,9 +172,12 @@ where_mpv() {
 
 # extract the video links from response of embed urls, extract mp4 links form m3u8 lists
 get_links() {
-    response="$(curl -e "$allanime_refr" -s "https://${allanime_base}$*" -A "$agent")"
+    response="$(curl -e "$allanime_refr" -s -m 8 "https://${allanime_base}$*" -A "$agent")"
     episode_link="$(printf '%s' "$response" | sed 's|},{|\
 |g' | sed -nE 's|.*link":"([^"]*)".*"resolutionStr":"([^"]*)".*|\2 >\1|p;s|.*hls","url":"([^"]*)".*"hardsub_lang":"en-US".*|\1|p')"
+
+    [ -z "$episode_link" ] && [ "$_diagnose_mode" = "1" ] && \
+        printf "\033[1;33m[DIAG] %s CDN raw response:\033[0m\n%s\n\n" "$provider_name" "$response" 1>&2
 
     case "$episode_link" in
         *repackager.wixmp.com*)
@@ -156,7 +191,7 @@ get_links() {
             m3u8_refr=$(printf '%s' "$response" | sed -nE 's|.*Referer":"([^"]*)".*|\1|p') && printf '%s\n' "m3u8_refr >$m3u8_refr" >"$cache_dir/m3u8_refr"
             extract_link=$(printf "%s" "$episode_link" | head -1 | cut -d'>' -f2)
             relative_link=$(printf "%s" "$extract_link" | sed 's|[^/]*$||')
-            m3u8_streams="$(curl -e "$m3u8_refr" -s "$extract_link" -A "$agent")"
+            m3u8_streams="$(curl -e "$m3u8_refr" -s -m 8 "$extract_link" -A "$agent")"
             printf "%s" "$m3u8_streams" | grep -q "EXTM3U" && printf "%s" "$m3u8_streams" | sed 's|^#EXT-X-STREAM.*x||g; s|,.*|p|g; /^#/d; $!N; s|\n| >|;/EXT-X-I-FRAME/d' |
                 sed "s|>|cc>${relative_link}|g" | sort -nr
             printf '%s' "$response" | sed -nE 's|.*"subtitles":\[\{"lang":"en","label":"English","default":"default","src":"([^"]*)".*|subtitle >\1|p' >"$cache_dir/suburl"
@@ -164,7 +199,6 @@ get_links() {
         *) [ -n "$episode_link" ] && printf "%s\n" "$episode_link" ;;
     esac
 
-    printf "%s" "$*" | grep -q "tools.fast4speed.rsvp" && printf "%s\n" "Yt >$*"
     printf "\033[1;32m%s\033[0m Links Fetched\n" "$provider_name" 1>&2
 }
 
@@ -182,7 +216,6 @@ generate_link() {
         2) provider_init "youtube" "/Yt-mp4 :/p" ;;   # youtube(mp4)(single)
         3) provider_init "sharepoint" "/S-mp4 :/p" ;; # sharepoint(mp4)(single)
         5) provider_init "filemoon" "/Fm-mp4 :/p" ;;  # filemoon(m3u8)(single)
-        *) provider_init "hianime" "/Luf-Mp4 :/p" ;;  # hianime(m3u8)(multi)
     esac
     if [ "$1" = "5" ] && [ -n "$provider_id" ]; then
         get_filemoon_links "$provider_id"
@@ -223,6 +256,8 @@ decode_tobeparsed() {
     plain="$(dd if="$tmp" bs=1 skip=13 count="$ct_len" 2>/dev/null | openssl enc -d -aes-256-ctr -K "$allanime_key" -iv "$ctr" -nosalt -nopad 2>/dev/null)"
     rm -f "$tmp"
     printf '%s' "$plain" | tr '{}' '\n' | sed -nE 's|.*"sourceUrl":"--([^"]*)".*"sourceName":"([^"]*)".*|\2 :\1|p'
+    _yt_url=$(printf '%s' "$plain" | tr '{}' '\n' | sed -nE 's|.*"sourceUrl":"(https://tools\.fast4speed\.rsvp[^"]*)".*|\1|p' | head -1)
+    [ -n "$_yt_url" ] && printf 'Yt >%s\n' "$_yt_url"
 }
 
 b64url_to_hex() {
@@ -237,7 +272,7 @@ b64url_to_hex() {
 }
 
 get_filemoon_links() {
-    response="$(curl -e "$allanime_refr" -s "https://${allanime_base}$1" -A "$agent")"
+    response="$(curl -e "$allanime_refr" -s -m 8 "https://${allanime_base}$1" -A "$agent")"
     _fm_json="$(printf '%s' "$response" | tr -d '\n ' | tr ',' '\n')"
     iv="$(printf '%s' "$_fm_json" | sed -nE 's|^"iv":"([^"]*)"$|\1|p')"
     payload="$(printf '%s' "$_fm_json" | sed -nE 's|^"payload":"([^"]*)"$|\1|p')"
@@ -279,10 +314,10 @@ get_episode_url() {
 
     api_url="${allanime_api}/api?variables=${encoded_vars}&extensions=${encoded_ext}"
 
-    api_resp="$(curl -e "https://youtu-chan.com" -s -A "$agent" -H "Origin: https://youtu-chan.com" "$api_url")"
+    api_resp="$(curl -e "https://youtu-chan.com" -s -m 5 -A "$agent" -H "Origin: https://youtu-chan.com" "$api_url")"
 
     if [ -z "$api_resp" ] || ! printf "%s" "$api_resp" | grep -q "tobeparsed"; then
-        api_resp="$(curl -e "$allanime_refr" -s -H "Content-Type: application/json" -X POST "${allanime_api}/api" --data "{\"variables\":{\"showId\":\"$id\",\"translationType\":\"$mode\",\"episodeString\":\"$ep_no\"},\"query\":\"$episode_embed_gql\"}" -A "$agent")"
+        api_resp="$(curl -e "$allanime_refr" -s -m 10 -H "Content-Type: application/json" -X POST "${allanime_api}/api" --data "{\"variables\":{\"showId\":\"$id\",\"translationType\":\"$mode\",\"episodeString\":\"$ep_no\"},\"query\":\"$episode_embed_gql\"}" -A "$agent")"
     fi
 
     if printf "%s" "$api_resp" | grep -q '"tobeparsed"'; then
@@ -291,12 +326,29 @@ get_episode_url() {
     else
         resp="$(printf "%s" "$api_resp" | tr '{}' '\n' | sed 's|\\u002F|\/|g;s|\\||g' | sed -nE 's|.*sourceUrl":"--([^"]*)".*sourceName":"([^"]*)".*|\2 :\1|p')"
     fi
-    # generate links into sequential files
+    _direct_links=$(printf '%s' "$resp" | grep '^Yt >')
+    resp=$(printf '%s' "$resp" | grep -v '^Yt >')
     cache_dir="$(mktemp -d)"
-    providers="1 2 3 4 5"
+    [ -n "$_direct_links" ] && printf '%s\n' "$_direct_links" > "$cache_dir/yt"
+    providers="1 2 3 5"
+    provider_pids=""
     for provider in $providers; do
         generate_link "$provider" >"$cache_dir"/"$provider" &
+        provider_pids="$provider_pids $!"
     done
+    # exit as soon as any provider returns a valid result
+    while true; do
+        for f in "$cache_dir"/*; do
+            [ -s "$f" ] && break 2
+        done
+        all_done=1
+        for pid in $provider_pids; do
+            kill -0 "$pid" 2>/dev/null && { all_done=0; break; }
+        done
+        [ "$all_done" = "1" ] && break
+        sleep 0.1
+    done
+    for pid in $provider_pids; do kill "$pid" 2>/dev/null; done
     wait
     # select the link with matching quality
     links=$(cat "$cache_dir"/* | sort -g -r -s)
@@ -307,6 +359,280 @@ get_episode_url() {
     else
         [ -z "$episode" ] && die "Episode not released!"
     fi
+}
+
+diagnose_episode() {
+    printf "\033[1;36m[DIAG] === anistream provider diagnosis ===\033[0m\n"
+    printf "\033[1;36m[DIAG] Show: %s | Episode: %s | Mode: %s\033[0m\n" "$id" "$ep_no" "$mode"
+
+    query_hash="d405d0edd690624b66baba3068e0edc3ac90f1597d898a1ec8db4e5c43c00fec"
+    query_vars="{\"showId\":\"$id\",\"translationType\":\"$mode\",\"episodeString\":\"$ep_no\"}"
+    query_ext="{\"persistedQuery\":{\"version\":1,\"sha256Hash\":\"$query_hash\"}}"
+    encoded_vars=$(printf '%s' "$query_vars" | sed 's/"/%22/g; s/:/%3A/g; s/{/%7B/g; s/}/%7D/g; s/,/%2C/g')
+    encoded_ext=$(printf '%s' "$query_ext" | sed 's/"/%22/g; s/:/%3A/g; s/{/%7B/g; s/}/%7D/g; s/,/%2C/g; s/ /%20/g')
+    api_url="${allanime_api}/api?variables=${encoded_vars}&extensions=${encoded_ext}"
+    printf "\033[1;36m[DIAG] Fetching episode sources from API (GET with persisted query)...\033[0m\n"
+    api_resp="$(curl -e "https://youtu-chan.com" -s -m 15 -A "$agent" -H "Origin: https://youtu-chan.com" "$api_url")"
+    if [ -z "$api_resp" ] || ! printf "%s" "$api_resp" | grep -q "tobeparsed"; then
+        printf "\033[1;33m[DIAG] GET returned no tobeparsed — falling back to POST\033[0m\n"
+        episode_embed_gql='query ($showId: String!, $translationType: VaildTranslationTypeEnumType!, $episodeString: String!) { episode( showId: $showId translationType: $translationType episodeString: $episodeString ) { episodeString sourceUrls }}'
+        api_resp="$(curl -e "$allanime_refr" -s -m 15 -H "Content-Type: application/json" -X POST "${allanime_api}/api" --data "{\"variables\":${query_vars},\"query\":\"$episode_embed_gql\"}" -A "$agent")"
+    fi
+
+    if [ -z "$api_resp" ]; then
+        printf "\033[1;31m[DIAG] API returned empty response — network issue or API down\033[0m\n"
+        return 1
+    fi
+
+    if printf "%s" "$api_resp" | grep -q '"tobeparsed"'; then
+        printf "\033[1;33m[DIAG] Response type: tobeparsed (AES-256-CTR encrypted)\033[0m\n"
+        blob="$(printf "%s" "$api_resp" | sed -nE 's|.*"tobeparsed":"([^"]*)".*|\1|p')"
+        resp="$(decode_tobeparsed "$blob")"
+    elif printf "%s" "$api_resp" | grep -q '"sourceUrl"'; then
+        printf "\033[1;33m[DIAG] Response type: plain sourceUrls\033[0m\n"
+        resp="$(printf "%s" "$api_resp" | tr '{}' '\n' | sed 's|\\u002F|\/|g;s|\\||g' | sed -nE 's|.*sourceUrl":"--([^"]*)".*sourceName":"([^"]*)".*|\2 :\1|p')"
+    else
+        printf "\033[1;31m[DIAG] API response has no sourceUrls or tobeparsed:\033[0m\n%s\n" "$(printf '%s' "$api_resp" | head -c 400)"
+        return 1
+    fi
+
+    if [ -z "$resp" ]; then
+        printf "\033[1;31m[DIAG] Provider list is empty after decoding — decryption may have failed\033[0m\n"
+        return 1
+    fi
+
+    printf "\033[1;32m[DIAG] Providers offered by AllAnime for this episode:\033[0m\n"
+    printf "%s\n" "$resp" | sed 's/ :.*//' | while read -r pname; do printf "  - %s\n" "$pname"; done
+
+    printf "\n\033[1;36m[DIAG] Testing each provider CDN response...\033[0m\n"
+    _diag_cache="$(mktemp -d)"
+    for provider in 1 2 3 4 5; do
+        generate_link "$provider" > "$_diag_cache/$provider" 2>/dev/null
+        _out="$(cat "$_diag_cache/$provider")"
+        if [ -n "$_out" ]; then
+            printf "\033[1;32m[DIAG] Provider %s => links found:\033[0m\n%s\n\n" "$provider" "$_out"
+        else
+            printf "\033[1;31m[DIAG] Provider %s => empty (CDN timeout, pattern mismatch, or not offered)\033[0m\n" "$provider"
+        fi
+    done
+    rm -r "$_diag_cache"
+    printf "\n\033[1;36m[DIAG] Done. If all providers are empty, the CDN endpoints are returning\033[0m\n"
+    printf "\033[1;36m[DIAG] responses that don't match any known format, or the CDN is down.\033[0m\n"
+}
+
+# MANGA
+
+manga_search() {
+    _resp=$(curl -sg -m 10 \
+        "https://api.mangadex.org/manga?title=$1&limit=20&availableTranslatedLanguage[]=en&hasAvailableChapters=true&order[followedCount]=desc" \
+        -H "Accept: application/json")
+    printf "%s" "$_resp" | jq -r '.data[] | [
+        .id,
+        ((.attributes.title.en // (.attributes.title | to_entries[0].value)) + " (" + (.attributes.status // "?") + ")")
+    ] | @tsv'
+}
+
+manga_chapters_list() {
+    _all=""
+    _offset=0
+    while true; do
+        _resp=$(curl -sg -m 15 \
+            "https://api.mangadex.org/manga/$1/feed?translatedLanguage[]=en&order[chapter]=asc&limit=500&offset=${_offset}")
+        _batch=$(printf "%s" "$_resp" | jq -r '.data[] | [
+            .id,
+            ((if .attributes.volume then "Vol." + .attributes.volume + " " else "" end) +
+             "Ch." + (.attributes.chapter // "?") +
+             (if .attributes.title and .attributes.title != "" then " - " + .attributes.title else "" end) +
+             (if .attributes.externalUrl then " [ext]" else "" end)),
+            (.attributes.externalUrl // "")
+        ] | @tsv')
+        _total=$(printf "%s" "$_resp" | jq -r '.total // 0')
+        _all=$(printf "%s\n%s" "$_all" "$_batch" | sed '/^$/d')
+        _offset=$((_offset + 500))
+        [ "$_offset" -ge "$_total" ] && break
+    done
+    printf "%s\n" "$_all"
+}
+
+manga_get_page_urls() {
+    _athome=$(curl -s -m 10 "https://api.mangadex.org/at-home/server/$1")
+    _base=$(printf "%s" "$_athome" | jq -r '.baseUrl')
+    _hash=$(printf "%s" "$_athome" | jq -r '.chapter.hash')
+    printf "%s" "$_athome" | jq -r --arg b "$_base" --arg h "$_hash" \
+        '.chapter.data[] | "\($b)/data/\($h)/\(.)"'
+}
+
+manga_read_chapter() {
+    _chapter_id="$1"
+    _title="$2"
+    _ext_url="$3"
+    if [ -n "$_ext_url" ]; then
+        printf "\033[1;33mThis chapter is hosted externally.\033[0m\n"
+        printf "\033[1;36mURL: %s\033[0m\n" "$_ext_url"
+        printf "Opening in browser...\n"
+        case "$(uname -s)" in
+            MINGW* | MSYS* | CYGWIN*) explorer.exe "$_ext_url" 2>/dev/null ;;
+            Darwin*) open "$_ext_url" 2>/dev/null ;;
+            *) xdg-open "$_ext_url" 2>/dev/null ;;
+        esac
+        return 0
+    fi
+    printf "\033[1;34mFetching pages for %s...\033[0m\n" "$_title"
+    _urls=$(manga_get_page_urls "$_chapter_id")
+    [ -z "$_urls" ] && die "No pages found for this chapter."
+    _total=$(printf "%s\n" "$_urls" | wc -l | tr -d ' ')
+    _page_list=$(mktemp)
+    printf "%s\n" "$_urls" > "$_page_list"
+    _tmp_img=$(mktemp --suffix=.jpg)
+    _page_num=1
+    _quit=0
+    while [ "$_quit" = "0" ]; do
+        _url=$(sed -n "${_page_num}p" "$_page_list")
+        [ -z "$_url" ] && break
+        printf "\033[2J\033[H"
+        printf "\033[1;34m%s  Page %s/%s  [Enter] next  [p] prev  [s] spread  [q] quit\033[0m\n" \
+            "$_title" "$_page_num" "$_total"
+        curl -s -m 30 "$_url" -o "$_tmp_img" 2>/dev/null
+        chafa --symbols=all --colors=full --size="${COLUMNS:-80}x$((${LINES:-24} - 2))" "$_tmp_img" 2>/dev/null
+        read -r _input
+        case "$_input" in
+            q | Q) _quit=1 ;;
+            p | P) [ "$_page_num" -gt 1 ] && _page_num=$((_page_num - 1)) ;;
+            s | S)
+                _url_r=$(sed -n "$((_page_num + 1))p" "$_page_list")
+                if [ -n "$_url_r" ]; then
+                    _sl=$(mktemp --suffix=.jpg)
+                    _sr=$(mktemp --suffix=.jpg)
+                    _ltxt=$(mktemp)
+                    _rtxt=$(mktemp)
+                    curl -s -m 30 "$_url" -o "$_sl" 2>/dev/null
+                    curl -s -m 30 "$_url_r" -o "$_sr" 2>/dev/null
+                    printf "\033[2J\033[H"
+                    printf "\033[1;34m%s  SPREAD %s+%s/%s  [Enter] advance past spread  [p] back  [q] quit\033[0m\n" \
+                        "$_title" "$_page_num" "$((_page_num + 1))" "$_total"
+                    chafa --symbols=all --colors=full --size="$((${COLUMNS:-80}/2))x$((${LINES:-24} - 2))" "$_sl" > "$_ltxt" 2>/dev/null
+                    chafa --symbols=all --colors=full --size="$((${COLUMNS:-80}/2))x$((${LINES:-24} - 2))" "$_sr" > "$_rtxt" 2>/dev/null
+                    paste "$_ltxt" "$_rtxt"
+                    rm -f "$_sl" "$_sr" "$_ltxt" "$_rtxt"
+                    read -r _si
+                    case "$_si" in
+                        q | Q) _quit=1 ;;
+                        p | P) [ "$_page_num" -gt 1 ] && _page_num=$((_page_num - 1)) ;;
+                        *) _page_num=$((_page_num + 2)) ;;
+                    esac
+                else
+                    printf "\033[1;33mAlready at last page — no next page for spread.\033[0m\n"
+                    sleep 1
+                fi
+                ;;
+            *) _page_num=$((_page_num + 1)) ;;
+        esac
+    done
+    rm -f "$_tmp_img" "$_page_list"
+}
+
+manga_update_history() {
+    if grep -q "	$2	" "$manga_histfile"; then
+        sed -E "s|^[^\t]+\t${2}\t.*$|${1}\t${2}\t${3}\t${4}|" "$manga_histfile" > "${manga_histfile}.new"
+    else
+        cp "$manga_histfile" "${manga_histfile}.new"
+        printf "%s\t%s\t%s\t%s\n" "$1" "$2" "$3" "$4" >> "${manga_histfile}.new"
+    fi
+    mv "${manga_histfile}.new" "$manga_histfile"
+}
+
+anilist_get_manga_media_id() {
+    [ -z "$anilist_token" ] && return 1
+    _clean=$(printf "%s" "$1" | sed 's/"/\\"/g')
+    _resp=$(anilist_query "{\"query\":\"{ Page { media(search: \\\"${_clean}\\\", type: MANGA) { id } } }\"}")
+    printf "%s" "$_resp" | jq -r '.data.Page.media[0].id // empty'
+}
+
+anilist_sync_manga_progress() {
+    [ -z "$anilist_token" ] && return 0
+    [ -z "$1" ] || [ -z "$2" ] && return 0
+    _ch_int=$(printf "%s" "$2" | grep -oE '[0-9]+' | head -1)
+    [ -z "$_ch_int" ] && return 0
+    _mut="{\"query\":\"mutation { SaveMediaListEntry(mediaId: $1, progress: ${_ch_int}, status: CURRENT) { id } }\"}"
+    _res=$(anilist_query "$_mut" | jq -r '.data.SaveMediaListEntry.id // empty')
+    [ -n "$_res" ] && printf "\033[1;32mAniList manga synced: Ch %s\033[0m\n" "$_ch_int" 1>&2
+}
+
+manga_main() {
+    if [ "$search" = "history" ]; then
+        [ ! -s "$manga_histfile" ] && die "No manga reading history!"
+        _hist_display=$(awk -F'\t' '{print $2 "\t" $3 " - " $4}' "$manga_histfile")
+        _result=$(printf "%s" "$_hist_display" | nl -w2 | sed 's/^[[:space:]]//' | nth "Select manga to continue: ")
+        manga_id=$(printf "%s" "$_result" | cut -f1)
+        manga_title=$(printf "%s" "$_result" | cut -f2 | sed 's/ - .*//')
+        _last_chapter_id=$(grep "	${manga_id}	" "$manga_histfile" | cut -f1)
+        printf "\033[1;34mFetching chapters...\033[0m\n"
+        chapter_list=$(manga_chapters_list "$manga_id")
+        [ -z "$chapter_list" ] && die "No English chapters found on MangaDex!"
+        chapter_list_ids=$(printf "%s" "$chapter_list" | cut -f1)
+        chapter_id=$(printf "%s\n" "$chapter_list_ids" | sed -n "/^${_last_chapter_id}$/{n;p;}" | head -1)
+        [ -z "$chapter_id" ] && chapter_id=$(printf "%s\n" "$chapter_list_ids" | tail -1)
+        chapter_display=$(printf "%s" "$chapter_list" | grep "^${chapter_id}	" | cut -f2)
+        chapter_ext_url=$(printf "%s" "$chapter_list" | grep "^${chapter_id}	" | cut -f3)
+    else
+        while [ -z "$query" ]; do
+            printf "\033[1;36mSearch manga: \033[0m" && read -r query
+            query=$(printf "%s" "$query" | tr -d '\r')
+        done
+        query=$(printf "%s" "$query" | sed "s| |+|g")
+        printf "\033[1;34mSearching MangaDex...\033[0m\n"
+        manga_list=$(manga_search "$query")
+        [ -z "$manga_list" ] && die "No manga found!"
+        _result=$(printf "%s" "$manga_list" | nl -w2 | sed 's/^[[:space:]]//' | nth "Select manga: ")
+        manga_id=$(printf "%s" "$_result" | cut -f1)
+        manga_title=$(printf "%s" "$_result" | cut -f2)
+        printf "\033[1;34mFetching chapters...\033[0m\n"
+        chapter_list=$(manga_chapters_list "$manga_id")
+        [ -z "$chapter_list" ] && die "No English chapters found on MangaDex!"
+        chapter_list_ids=$(printf "%s" "$chapter_list" | cut -f1)
+        chapter_result=$(printf "%s" "$chapter_list" | nl -w2 | sed 's/^[[:space:]]//' | nth "Select chapter: ")
+        chapter_id=$(printf "%s" "$chapter_result" | cut -f1)
+        chapter_display=$(printf "%s" "$chapter_result" | cut -f2)
+        chapter_ext_url=$(printf "%s" "$chapter_list" | grep "^${chapter_id}	" | cut -f3)
+    fi
+    _al_manga_id=$(anilist_get_manga_media_id "$manga_title" 2>/dev/null) || _al_manga_id=""
+    manga_read_chapter "$chapter_id" "$chapter_display" "$chapter_ext_url"
+    manga_update_history "$chapter_id" "$manga_id" "$manga_title" "$chapter_display"
+    anilist_sync_manga_progress "$_al_manga_id" "$chapter_display"
+    while cmd=$(printf "next\nprevious\nselect\nquit" | nth "Read $chapter_display of $manga_title... "); do
+        case "$cmd" in
+            next)
+                _next_id=$(printf "%s\n" "$chapter_list_ids" | sed -n "/^${chapter_id}$/{n;p;}")
+                if [ -z "$_next_id" ]; then
+                    printf "\033[1;33mAlready at the last chapter.\033[0m\n"
+                    continue
+                fi
+                chapter_id="$_next_id"
+                chapter_display=$(printf "%s" "$chapter_list" | grep "^${chapter_id}	" | cut -f2)
+                chapter_ext_url=$(printf "%s" "$chapter_list" | grep "^${chapter_id}	" | cut -f3)
+                ;;
+            previous)
+                _prev_id=$(printf "%s\n" "$chapter_list_ids" | sed -n "/^${chapter_id}$/{g;1!p;};h")
+                if [ -z "$_prev_id" ]; then
+                    printf "\033[1;33mAlready at the first chapter.\033[0m\n"
+                    continue
+                fi
+                chapter_id="$_prev_id"
+                chapter_display=$(printf "%s" "$chapter_list" | grep "^${chapter_id}	" | cut -f2)
+                chapter_ext_url=$(printf "%s" "$chapter_list" | grep "^${chapter_id}	" | cut -f3)
+                ;;
+            select)
+                chapter_result=$(printf "%s" "$chapter_list" | nl -w2 | sed 's/^[[:space:]]//' | nth "Select chapter: ")
+                chapter_id=$(printf "%s" "$chapter_result" | cut -f1)
+                chapter_display=$(printf "%s" "$chapter_result" | cut -f2)
+                chapter_ext_url=$(printf "%s" "$chapter_list" | grep "^${chapter_id}	" | cut -f3)
+                ;;
+            quit) break ;;
+        esac
+        manga_read_chapter "$chapter_id" "$chapter_display" "$chapter_ext_url"
+        manga_update_history "$chapter_id" "$manga_id" "$manga_title" "$chapter_display"
+        anilist_sync_manga_progress "$_al_manga_id" "$chapter_display"
+    done
 }
 
 # search the query and give results
@@ -339,6 +665,166 @@ episodes_list() {
 
     curl -e "$allanime_refr" -s -H "Content-Type: application/json" -X POST "${allanime_api}/api" --data "{\"variables\":{\"showId\":\"$*\"},\"query\":\"$episodes_list_gql\"}" -A "$agent" | sed -nE "s|.*$mode\":\[([0-9.\",]*)\].*|\1|p" | sed 's|,|\
 |g; s|"||g' | sort -n -k 1
+}
+
+# ANILIST
+
+anilist_load_token() {
+    [ -f "$anilist_token_file" ] && anilist_token="$(cat "$anilist_token_file")"
+}
+
+anilist_login() {
+    [ -z "$anilist_client_id" ] && die "Set ANI_CLI_ANILIST_CLIENT_ID to your AniList client ID first."
+    auth_url="https://anilist.co/api/v2/oauth/authorize?client_id=${anilist_client_id}&response_type=token"
+    printf "\033[1;34mOpen this URL in your browser:\033[0m\n%s\n\n" "$auth_url"
+    printf "AniList will display your access token on that page. Paste it here: "
+    read -r anilist_token
+    [ -z "$anilist_token" ] && die "No token entered."
+    mkdir -p "$anilist_config_dir"
+    printf "%s" "$anilist_token" >"$anilist_token_file"
+    chmod 600 "$anilist_token_file"
+    printf "\033[1;32mToken saved. Verifying with AniList...\033[0m\n"
+    anilist_get_user_id
+    exit 0
+}
+
+anilist_query() {
+    curl -s -X POST "https://graphql.anilist.co" \
+        -H "Content-Type: application/json" \
+        -H "Accept: application/json" \
+        -H "Authorization: Bearer $anilist_token" \
+        --data "$1"
+}
+
+anilist_get_user_id() {
+    _resp=$(anilist_query '{"query":"{ Viewer { id name } }"}')
+    _uid=$(printf "%s" "$_resp" | jq -r '.data.Viewer.id // empty')
+    [ -z "$_uid" ] && die "AniList: token invalid or expired. Run --anilist-login again."
+    printf "%s" "$_uid" >"$anilist_user_id_file"
+    _name=$(printf "%s" "$_resp" | jq -r '.data.Viewer.name // "unknown"')
+    printf "\033[1;32mLogged in to AniList as: %s\033[0m\n" "$_name"
+}
+
+anilist_get_media_id() {
+    _cache="$anilist_cache_dir/id_cache"
+    [ -f "$_cache" ] && _cached=$(grep -m1 "^${id}	" "$_cache" | cut -f2)
+    [ -n "$_cached" ] && printf "%s" "$_cached" && return 0
+    _clean=$(printf "%s" "$1" | sed 's/"/\\"/g')
+    _resp=$(anilist_query "{\"query\":\"{ Page { media(search: \\\"${_clean}\\\", type: ANIME) { id } } }\"}")
+    _mid=$(printf "%s" "$_resp" | jq -r '.data.Page.media[0].id // empty')
+    [ -z "$_mid" ] && return 1
+    mkdir -p "$anilist_cache_dir"
+    printf "%s\t%s\n" "$id" "$_mid" >>"$_cache"
+    printf "%s" "$_mid"
+}
+
+anilist_sync_progress() {
+    [ -z "$anilist_token" ] && return 0
+    [ -z "$1" ] && return 0
+    if [ -n "$_pct" ] && [ "$_pct" -lt 10 ] 2>/dev/null; then
+        printf "\033[1;33mAniList: watched %s%%, skipping sync (need >10%%)\033[0m\n" "$_pct" 1>&2
+        return 0
+    fi
+    _status="CURRENT"
+    [ -n "$latest_ep" ] && [ "$ep_no" = "$latest_ep" ] && _status="COMPLETED"
+    _mut="{\"query\":\"mutation { SaveMediaListEntry(mediaId: $1, progress: ${ep_no}, status: ${_status}) { id } }\"}"
+    _res=$(anilist_query "$_mut" | jq -r '.data.SaveMediaListEntry.id // empty')
+    [ -n "$_res" ] && printf "\033[1;32mAniList synced: ep %s [%s]\033[0m\n" "$ep_no" "$_status" 1>&2
+}
+
+anilist_get_watching_list() {
+    [ -z "$anilist_token" ] && return 0
+    [ ! -f "$anilist_user_id_file" ] && return 0
+    _uid=$(cat "$anilist_user_id_file")
+    _cache="$anilist_cache_dir/id_cache"
+    [ ! -f "$_cache" ] && return 0
+    _q="{\"query\":\"{ MediaListCollection(userId: ${_uid}, type: ANIME, status: CURRENT) { lists { entries { mediaId progress media { title { romaji } episodes } } } } }\"}"
+    anilist_query "$_q" | jq -r '
+        .data.MediaListCollection.lists[].entries[] |
+        [(.mediaId|tostring), .media.title.romaji, ((.media.episodes//"?")|tostring), ((.progress+1)|tostring)] |
+        @tsv' |
+    while IFS='	' read -r _al_id _al_title _al_eps _al_next; do
+        _ani_id=$(grep "	${_al_id}$" "$_cache" | head -1 | cut -f1)
+        [ -n "$_ani_id" ] && printf "%s\t%s (%s episodes) - episode %s\n" "$_ani_id" "$_al_title" "$_al_eps" "$_al_next"
+    done
+}
+
+anilist_write_preview_script() {
+    # $1 = path to data file containing raw anime_list (allanime_id\ttitle lines)
+    mkdir -p "$anilist_cache_dir"
+    _ps="$anilist_cache_dir/preview.sh"
+    _thumb_dir_win="$(cygpath -w "$anilist_cache_dir/thumbnails" 2>/dev/null)"
+    printf '#!/bin/bash\nCACHE_DIR="%s"\nDATA_FILE="%s"\nTHUMB_DIR_WIN="%s"\n' \
+        "$anilist_cache_dir" "$1" "$_thumb_dir_win" > "$_ps"
+    cat >> "$_ps" << 'PREVIEW_SCRIPT_EOF'
+# $1 = line number from fzf {1} — avoids shell-quoting issues with special chars in titles
+LINE_NUM="$1"
+[ -z "$LINE_NUM" ] && exit 0
+TITLE=$(sed -n "${LINE_NUM}p" "$DATA_FILE" | cut -f2 | sed 's/ ([0-9]* episodes)$//')
+[ -z "$TITLE" ] && exit 0
+KEY=$(printf "%s" "$TITLE" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/_/g' | cut -c1-80)
+THUMB_DIR="$CACHE_DIR/thumbnails"
+mkdir -p "$THUMB_DIR"
+INFO_FILE="$THUMB_DIR/${KEY}.json"
+IMG_FILE="$THUMB_DIR/${KEY}.jpg"
+if [ ! -f "$INFO_FILE" ]; then
+    CLEAN=$(printf "%s" "$TITLE" | sed 's/"/\\"/g')
+    RESP=$(curl -s -m 5 -X POST "https://graphql.anilist.co" \
+        -H "Content-Type: application/json" \
+        -H "Accept: application/json" \
+        --data "{\"query\":\"{ Page(perPage:1) { media(search:\\\"${CLEAN}\\\",type:ANIME) { title{romaji} coverImage{large} averageScore status episodes } } }\"}" 2>/dev/null)
+    [ -n "$RESP" ] && printf "%s" "$RESP" > "$INFO_FILE"
+fi
+if [ -f "$INFO_FILE" ]; then
+    IMG_URL=$(sed -nE 's|.*"large":"([^"]*)".*|\1|p' "$INFO_FILE" | head -1 | sed 's|[\\]/|/|g; s|[\\]u002F|/|g')
+    SCORE=$(sed -nE 's|.*"averageScore":([0-9]+).*|\1|p' "$INFO_FILE" | head -1)
+    STATUS=$(sed -nE 's|.*"status":"([^"]*)".*|\1|p' "$INFO_FILE" | head -1)
+    EPISODES=$(sed -nE 's|.*"episodes":([0-9]+).*|\1|p' "$INFO_FILE" | head -1)
+    ROM_TITLE=$(sed -nE 's|.*"romaji":"([^"]*)".*|\1|p' "$INFO_FILE" | head -1)
+    [ -n "$IMG_URL" ] && [ ! -f "$IMG_FILE" ] && \
+        curl -s -m 10 "$IMG_URL" -o "$IMG_FILE" 2>/dev/null
+    [ -f "$IMG_FILE" ] && printf "%s\\%s.jpg" "$THUMB_DIR_WIN" "$KEY" > "${CACHE_DIR}/current_preview"
+    printf "\n"
+    [ -n "$ROM_TITLE" ] && printf "\033[1;36m%s\033[0m\n"            "$ROM_TITLE"
+    [ -n "$SCORE" ]     && printf "\033[1;33mScore:\033[0m %s/100\n" "$SCORE"
+    [ -n "$STATUS" ]    && printf "\033[1;32mStatus:\033[0m %s\n"    "$STATUS"
+    [ -n "$EPISODES" ]  && printf "\033[1;35mEpisodes:\033[0m %s\n"  "$EPISODES"
+fi
+PREVIEW_SCRIPT_EOF
+    chmod +x "$_ps"
+    printf "%s" "$_ps"
+}
+
+anilist_write_preview_window_script() {
+    _ps1="$anilist_cache_dir/preview_window.ps1"
+    cat > "$_ps1" << 'PS1_WINDOW_EOF'
+param([string]$WatchFile)
+Add-Type -AssemblyName PresentationFramework
+$xaml = '<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Title="Anime Cover" Width="310" Height="440" WindowStartupLocation="CenterScreen" ShowInTaskbar="True" Background="#0d0d0d" ResizeMode="CanResize"><Grid><Image Name="img" Stretch="Uniform" StretchDirection="Both"/></Grid></Window>'
+$window = [Windows.Markup.XamlReader]::Parse($xaml)
+$imgCtrl = $window.FindName("img")
+$script:lastPath = ""
+$timer = New-Object System.Windows.Threading.DispatcherTimer
+$timer.Interval = [TimeSpan]::FromMilliseconds(400)
+$timer.Add_Tick({
+    if (-not (Test-Path $WatchFile)) { $window.Close(); return }
+    try { $p = [System.IO.File]::ReadAllText($WatchFile).Trim() } catch { return }
+    if (-not $p -or $p -eq $script:lastPath) { return }
+    if (-not (Test-Path $p)) { return }
+    $script:lastPath = $p
+    try {
+        $bmp = New-Object System.Windows.Media.Imaging.BitmapImage
+        $bmp.BeginInit()
+        $bmp.UriSource = [Uri]::new("file:///" + $p.Replace('\', '/'))
+        $bmp.CacheOption = [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad
+        $bmp.EndInit()
+        $imgCtrl.Source = $bmp
+    } catch {}
+})
+$timer.Start()
+$window.ShowDialog() | Out-Null
+PS1_WINDOW_EOF
+    printf "%s" "$_ps1"
 }
 
 # PLAYING
@@ -395,8 +881,15 @@ play_episode() {
             if [ "$no_detach" = 0 ]; then
                 nohup $player_function $skip_flag --force-media-title="${allanime_title}Episode ${ep_no}" "$episode" $subs_flag $refr_flag >/dev/null 2>&1 &
             else
-                $player_function $skip_flag $subs_flag $refr_flag --force-media-title="${allanime_title}Episode ${ep_no}" "$episode"
-                mpv_exitcode=$?
+                _pct=""
+                _stopped_at=""
+                : > "$_tmp_pos"
+                $player_function $skip_flag $subs_flag $refr_flag \
+                    --force-media-title="${allanime_title}Episode ${ep_no}" "$episode" \
+                    --msg-level=ffmpeg/demuxer=error 2>&1 | tee "$_tmp_pos"
+                mpv_exitcode="${PIPESTATUS[0]:-0}"
+                _stopped_at=$(sed -nE 's@.*AV: ([0-9:]*) / ([0-9:]*) \(([0-9]*)%\).*@\1@p' "$_tmp_pos" | tail -1)
+                _pct=$(sed -nE 's@.*AV: ([0-9:]*) / ([0-9:]*) \(([0-9]*)%\).*@\3@p' "$_tmp_pos" | tail -1)
                 [ "$exit_after_play" = 1 ] && [ -z "$range" ] && exit "$mpv_exitcode"
             fi
             ;;
@@ -426,6 +919,7 @@ play_episode() {
     replay="$episode"
     unset episode
     update_history
+    anilist_sync_progress "$al_media_id"
     [ "$use_external_menu" = "1" ] && wait
     [ "$use_external_menu" = "2" ] && wait
 }
@@ -476,7 +970,7 @@ case "$(uname -a | cut -d " " -f 1,3-)" in
     *) player_function="${ANI_CLI_PLAYER:-$(where_mpv)}" ;;           # Linux OS
 esac
 
-no_detach="${ANI_CLI_NO_DETACH:-0}"
+no_detach="${ANI_CLI_NO_DETACH:-1}"
 exit_after_play="${ANI_CLI_EXIT_AFTER_PLAY:-0}"
 use_external_menu="${ANI_CLI_EXTERNAL_MENU:-0}"
 external_menu_normal_window="${ANI_CLI_EXTERNAL_MENU_NORMAL_WINDOW:-0}"
@@ -489,6 +983,28 @@ hist_dir="${ANI_CLI_HIST_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ani-cli}"
 histfile="$hist_dir/ani-hsts"
 [ ! -f "$histfile" ] && : >"$histfile"
 search="${ANI_CLI_DEFAULT_SOURCE:-scrape}"
+
+# ANILIST CONFIG
+# Set ANI_CLI_ANILIST_CLIENT_ID to your AniList client ID (from anilist.co/settings/developer)
+anilist_client_id="${ANI_CLI_ANILIST_CLIENT_ID:-40958}"
+anilist_config_dir="${ANI_CLI_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/ani-cli}"
+anilist_token_file="$anilist_config_dir/anilist_token"
+anilist_user_id_file="$anilist_config_dir/anilist_user_id"
+anilist_cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/ani-cli"
+anilist_token=""
+al_media_id=""
+latest_ep=""
+show_thumbnails="${ANI_CLI_THUMBNAILS:-1}"
+_ani_preview_script=""
+_ani_preview_win_script=""
+anilist_load_token
+_pct=""
+_stopped_at=""
+_tmp_pos="${TMPDIR:-/tmp}/anistream_position"
+_diagnose_mode=0
+manga_histfile="$hist_dir/manga-hsts"
+[ ! -f "$manga_histfile" ] && : >"$manga_histfile"
+_manga_mode=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -557,6 +1073,10 @@ while [ $# -gt 0 ]; do
             ;;
         -N | --nextep-countdown) search=nextep ;;
         -U | --update) update_script ;;
+        --anilist-login) anilist_login ;;
+        --no-anilist) anilist_token="" ;;
+        --diagnose) _diagnose_mode=1 ;;
+        --manga) _manga_mode=1 ;;
         *) query="$(printf "%s" "$query $1" | sed "s|^ ||;s| |+|g")" ;;
     esac
     shift
@@ -572,6 +1092,8 @@ case "$(uname -o 2>/dev/null)" in
 esac
 [ "$skip_intro" = 1 ] && (dep_ch "ani-skip" || true)
 dep_ch "fzf" || true
+[ -n "$anilist_token" ] && (dep_ch "jq" || true)
+[ "$_manga_mode" = "1" ] && dep_ch "jq" "chafa"
 case "$player_function" in
     debug) ;;
     download) dep_ch "ffmpeg" "aria2c" ;;
@@ -581,17 +1103,24 @@ case "$player_function" in
     *) dep_ch "$player_function" ;;
 esac
 
+[ "$_manga_mode" = "1" ] && manga_main && exit 0
+
 # searching
 case "$search" in
     history)
         anime_list=$(while read -r ep_no id title; do process_hist_entry & done <"$histfile")
         wait
+        _al_watching=$(anilist_get_watching_list 2>/dev/null)
+        [ -n "$_al_watching" ] && anime_list=$(printf "%s\n%s" "$_al_watching" "$anime_list" | sed '/^$/d')
         [ -z "$anime_list" ] && die "No unwatched series in history!"
         [ -z "${index##*[!0-9]*}" ] && id=$(printf "%s" "$anime_list" | nl -w 2 | sed 's/^[[:space:]]//' | nth "Select anime: " | cut -f1)
         [ -z "${index##*[!0-9]*}" ] || id=$(printf "%s" "$anime_list" | sed -n "${index}p" | cut -f1)
         [ -z "$id" ] && exit 1
         title=$(printf "%s" "$anime_list" | grep "$id" | cut -f2 | sed 's/ - episode.*//')
         ep_list=$(episodes_list "$id")
+        latest_ep=$(printf "%s\n" "$ep_list" | tail -n1)
+        _al_cache="$anilist_cache_dir/id_cache"
+        [ -f "$_al_cache" ] && al_media_id=$(grep "^${id}	" "$_al_cache" | head -1 | cut -f2)
         ep_no=$(printf "%s" "$anime_list" | grep "$id" | cut -f2 | sed -nE 's/.*- episode (.+)$/\1/p')
         allanime_title="$(printf "%s" "$title" | cut -d'(' -f1 | tr -d '[:punct:]')"
         ;;
@@ -599,6 +1128,7 @@ case "$search" in
         if [ "$use_external_menu" = "0" ]; then
             while [ -z "$query" ]; do
                 printf "\33[2K\r\033[1;36mSearch anime: \033[0m" && read -r query
+                query=$(printf "%s" "$query" | tr -d '\r')
             done
         else
             [ -z "$query" ] && query=$(printf "" | external_menu "" "Search anime: " "$external_menu_args")
@@ -611,17 +1141,34 @@ case "$search" in
         anime_list=$(search_anime "$query")
         [ -z "$anime_list" ] && die "No results found!"
         [ "$index" -eq "$index" ] 2>/dev/null && result=$(printf "%s" "$anime_list" | sed -n "${index}p")
-        [ -z "$index" ] && result=$(printf "%s" "$anime_list" | nl -w 2 | sed 's/^[[:space:]]//' | nth "Select anime: ")
+        if [ -z "$index" ]; then
+            if [ "$use_external_menu" = "0" ] && [ "$show_thumbnails" = "1" ]; then
+                _anime_data_file="$anilist_cache_dir/current_search.tsv"
+                mkdir -p "$anilist_cache_dir"
+                printf "%s" "$anime_list" > "$_anime_data_file"
+                _ani_preview_script=$(anilist_write_preview_script "$_anime_data_file")
+                case "$(uname -s)" in
+                    MINGW* | MSYS* | CYGWIN*)
+                        _ani_preview_win_script=$(anilist_write_preview_window_script)
+                        ;;
+                esac
+            fi
+            result=$(printf "%s" "$anime_list" | nl -w 2 | sed 's/^[[:space:]]//' | nth "Select anime: ")
+            _ani_preview_script=""
+        fi
         [ -z "$result" ] && exit 1
         title=$(printf "%s" "$result" | cut -f2)
         allanime_title="$(printf "%s" "$title" | cut -d'(' -f1 | tr -d '[:punct:]')"
         id=$(printf "%s" "$result" | cut -f1)
         ep_list=$(episodes_list "$id")
+        latest_ep=$(printf "%s\n" "$ep_list" | tail -n1)
+        al_media_id=$(anilist_get_media_id "$allanime_title" 2>/dev/null) || al_media_id=""
         [ -z "$ep_no" ] && ep_no=$(printf "%s" "$ep_list" | nth "Select episode: " "$multi_selection_flag")
         [ -z "$ep_no" ] && exit 1
         ;;
 esac
 [ "$skip_intro" = 1 ] && mal_id="$(ani-skip -q "${skip_title:-${title}}")"
+[ "$_diagnose_mode" = "1" ] && { diagnose_episode; exit 0; }
 
 # moves the cursor up one line and clears that line
 tput cuu1 && tput el
