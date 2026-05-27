@@ -7,7 +7,7 @@ POSIX sh script (v4.14.0). Streams anime via AllAnime API, plays with mpv.exe. W
 ## Sync After Every Change
 
 ```sh
-cp ~/ani-cli/ani-cli /c/Users/esteb/scoop/apps/ani-cli/current/ani-cli
+cp ~/ani-cli/ani /c/Users/esteb/scoop/apps/ani-cli/current/ani
 ```
 
 Both files must be kept identical. The live path is what actually runs.
@@ -73,8 +73,8 @@ Token stored at `$anilist_token_file` (chmod 600). Never log, display, or store 
 ## Testing
 
 ```sh
-bash -n ~/ani-cli/ani-cli          # syntax check
-ani-cli "classroom of the elite"   # anime smoke test
-ani-cli --manga "berserk"          # manga smoke test
-ani-cli --continue                 # history smoke test
+bash -n ~/ani-cli/ani              # syntax check
+ani "classroom of the elite"       # anime smoke test
+ani --manga "berserk"              # manga smoke test
+ani --continue                     # history smoke test
 ```
