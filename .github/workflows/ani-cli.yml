@@ -27,7 +27,7 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: test exec bit
-      run: test -x "./ani-cli"
+      run: test -x "./ani"
 
   check-no-awk:
     name: No Awk Allowed
@@ -35,4 +35,4 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: verify that noone added awk
-      run: '! grep awk "./ani-cli"'
+      run: '! grep awk "./ani"'

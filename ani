@@ -884,10 +884,16 @@ play_episode() {
                 _pct=""
                 _stopped_at=""
                 : > "$_tmp_pos"
+                _fifo="${_tmp_pos}.fifo"
+                mkfifo "$_fifo"
+                tee "$_tmp_pos" < "$_fifo" &
+                _tee_pid=$!
                 $player_function $skip_flag $subs_flag $refr_flag \
                     --force-media-title="${allanime_title}Episode ${ep_no}" "$episode" \
-                    --msg-level=ffmpeg/demuxer=error 2>&1 | tee "$_tmp_pos"
-                mpv_exitcode="${PIPESTATUS[0]:-0}"
+                    --msg-level=ffmpeg/demuxer=error > "$_fifo" 2>&1
+                mpv_exitcode=$?
+                wait "$_tee_pid"
+                rm -f "$_fifo"
                 _stopped_at=$(sed -nE 's@.*AV: ([0-9:]*) / ([0-9:]*) \(([0-9]*)%\).*@\1@p' "$_tmp_pos" | tail -1)
                 _pct=$(sed -nE 's@.*AV: ([0-9:]*) / ([0-9:]*) \(([0-9]*)%\).*@\3@p' "$_tmp_pos" | tail -1)
                 [ "$exit_after_play" = 1 ] && [ -z "$range" ] && exit "$mpv_exitcode"
