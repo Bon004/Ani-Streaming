@@ -26,6 +26,13 @@ Both files must be kept identical. The live path is what actually runs.
 - Extracts `https://tools.fast4speed.rsvp/...` directly from tobeparsed JSON
 - Written to `$cache_dir/yt`, consumed by `get_episode_url()` which opens it directly
 
+**2b. AllAnime aaReq token** (`get_aa_req()`, added 2026-07-17)
+- Episode queries now require an encrypted `aaReq` extension + `x-build-id` header, else `AA_CRYPTO_MISSING`
+- Token = base64(0x01 || iv || AES-256-GCM(payload) || tag); iv = first 12 bytes of sha256("epoch:buildId:queryHash:ts"); ts = unix time floored to 300s, in ms
+- Encryption done with `node -e` (upstream uses botan — not available on Windows/scoop)
+- Key/epoch/build rotate server-side (`AA_CRYPTO_STALE`). Current values in `allanime_key` / `allanime_aa_epoch` / `allanime_aa_build`; override with `ANI_CLI_AA_KEY` / `ANI_CLI_AA_EPOCH` / `ANI_CLI_AA_BUILD`. When stale, check upstream pystardust/ani-cli `fix` branch and PRs for new values
+- Same rotating key also decrypts `tobeparsed` responses (used by `process_response`/`decode_tobeparsed`)
+
 **3. Manga support** (`manga_main()` and helpers, ~line 420)
 - `--manga` flag, isolated behind `[ "$_manga_mode" = "1" ] && manga_main && exit 0`
 - Source: MangaDex public REST API (no auth)
@@ -60,6 +67,7 @@ Both files must be kept identical. The live path is what actually runs.
 | Dep | Required by | Install |
 |-----|-------------|---------|
 | curl, sed, grep, openssl | core | system |
+| node | aaReq token (AES-GCM) | nodejs.org / scoop |
 | fzf | selection UI | `scoop install fzf` |
 | mpv | playback | `scoop install mpv` |
 | jq | AniList sync + manga | `scoop install jq` |
