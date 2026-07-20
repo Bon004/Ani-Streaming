@@ -26,12 +26,23 @@ Both files must be kept identical. The live path is what actually runs.
 - Extracts `https://tools.fast4speed.rsvp/...` directly from tobeparsed JSON
 - Written to `$cache_dir/yt`, consumed by `get_episode_url()` which opens it directly
 
-**2b. AllAnime aaReq token** (`get_aa_req()`, added 2026-07-17)
-- Episode queries now require an encrypted `aaReq` extension + `x-build-id` header, else `AA_CRYPTO_MISSING`
-- Token = base64(0x01 || iv || AES-256-GCM(payload) || tag); iv = first 12 bytes of sha256("epoch:buildId:queryHash:ts"); ts = unix time floored to 300s, in ms
-- Encryption done with `node -e` (upstream uses botan — not available on Windows/scoop)
-- Key/epoch/build rotate server-side (`AA_CRYPTO_STALE`). Current values in `allanime_key` / `allanime_aa_epoch` / `allanime_aa_build`; override with `ANI_CLI_AA_KEY` / `ANI_CLI_AA_EPOCH` / `ANI_CLI_AA_BUILD`. When stale, check upstream pystardust/ani-cli `fix` branch and PRs for new values
-- Same rotating key also decrypts `tobeparsed` responses (used by `process_response`/`decode_tobeparsed`)
+**2b. mkissa migration + aaReq token** (`get_crypto()` / `get_aa_req()`, migrated 2026-07-19)
+- AllAnime's backend moved to **mkissa** (site drama / host takeover). Live hosts: token'd episode + search API `allanime_api="https://api.mkissa.net"`, referrer/Origin `https://mkissa.to`. BUT the internal clock endpoint (Default/wixmp provider) still lives at `allanime.day/apivtwo/clock.json` — only allanime.day's *root/graphql* is Cloudflare-walled, the clock path returns 200. So `allanime_base="allanime.day"` (clock) and `allanime_api` is set explicitly to mkissa, NOT derived from base
+- Episode queries require an encrypted `aaReq` extension, else `AA_CRYPTO_MISSING`; wrong epoch/build → `AA_CRYPTO_STALE`
+- Token = base64(0x01 || iv || AES-256-GCM(payload) || tag); iv = first 12 bytes of sha256("epoch:buildId:queryHash:ts"); ts = unix time floored to 300s, in ms. `buildId` is currently **49**. Encryption done with `node -e` (upstream uses botan — not on Windows/scoop)
+- **Split key** (`get_crypto()`): `key = partB XOR mask`.
+  - `partB` + `epoch` rotate ~every 3 days, served in mkissa.to SSR HTML as `window.__aaCrypto={...}`
+  - `mask` is a bare 64-hex literal baked into the JS chunk that also references `__aaCrypto` (changes on site redeploy). Found by walking `app.js`'s `../chunks/*.js` imports — NOT in the homepage modulepreload list, so stl3's `bd="..."` regex misses it
+  - Derived key cached at `$aa_crypto_cache` (`~/.cache/ani-cli/aa_crypto`) for `$aa_crypto_ttl` (21600s / 6h). On any `AA_CRYPTO` error, `get_episode_url` busts the cache and retries once
+  - Env pins still win: `ANI_CLI_AA_KEY` + `ANI_CLI_AA_EPOCH` (both) skip the fetch; `ANI_CLI_AA_BUILD` overrides buildId
+- Same derived key decrypts `tobeparsed` responses (`process_response`/`decode_tobeparsed`)
+
+**2c. Provider layer** (mkissa serves a different provider mix than old AllAnime)
+- `decode_tobeparsed` and `get_episode_url` capture the FULL `sourceUrl` (both `--`-internal and absolute). Capturing only `--` (the old fork bug) dropped every absolute provider
+- The old `--`-internal providers (Luf-Mp4, Ak, Uv-mp4…) are mostly dead — their clock host is gone. **Default (wixmp)** still works via the allanime.day clock but is absent from most current shows
+- **ok.ru (`Ok`) is the widest-coverage provider** (~all popular shows offer it) — resolved by handing the `https://ok.ru/videoembed/...` embed to **yt-dlp** (`get_links` `*ok.ru*` branch, provider slot 6). yt-dlp does NOT support filemoon/streamwish/streamlare/streamsb/vidnest, so ok.ru is the only viable yt-dlp host
+- Working provider chain: wixmp (slot 1, rare) → mp4upload (slot 4, often dead/deleted) → ok.ru (slot 6, primary). Coverage ~75%; remaining failures are per-video copyright takedowns of the ok.ru source (nothing code can fix)
+- Reference: stl3's `ani-cli-rpi` `cdntesting` branch pioneered the mkissa crypto (but only wixmp+mp4upload providers — it also fails on modern shows). Upstream pystardust hasn't merged a fix. When it breaks again, re-check the buildId/mask first, then provider availability
 
 **3. Manga support** (`manga_main()` and helpers, ~line 420)
 - `--manga` flag, isolated behind `[ "$_manga_mode" = "1" ] && manga_main && exit 0`
@@ -68,6 +79,7 @@ Both files must be kept identical. The live path is what actually runs.
 |-----|-------------|---------|
 | curl, sed, grep, openssl | core | system |
 | node | aaReq token (AES-GCM) | nodejs.org / scoop |
+| yt-dlp | ok.ru provider (primary playback path) | `scoop install yt-dlp` |
 | fzf | selection UI | `scoop install fzf` |
 | mpv | playback | `scoop install mpv` |
 | jq | AniList sync + manga | `scoop install jq` |
