@@ -1,0 +1,7 @@
+# credentials and personal state must never reach the public fork
+ani-cli-data/
+.env
+*.env
+env
+anilist_token
+anilist_client_secret
