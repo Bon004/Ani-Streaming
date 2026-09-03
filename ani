@@ -406,10 +406,12 @@ anilist_get_watching_list() {
     anilist_query "$_q" | jq -r '
         .data.MediaListCollection.lists[].entries[] |
         [(.mediaId|tostring), .media.title.romaji, ((.media.episodes//"?")|tostring), ((.progress+1)|tostring)] |
-        @tsv' |
+        @tsv' | tr -d '\r' |
         while IFS='	' read -r _al_id _al_title _al_eps _al_next; do
             _ani_id=$(grep "	${_al_id}$" "$_cache" | head -1 | cut -f1)
-            [ -n "$_ani_id" ] && printf "%s\t%s (%s episodes) - episode %s\n" "$_ani_id" "$_al_title" "$_al_eps" "$_al_next"
+            # tagged: %s is a position within the season, not an anidb episode
+            # number — the history branch converts it once ep_list is known
+            [ -n "$_ani_id" ] && printf "%s\t%s (%s episodes) - episode %s (AniList)\n" "$_ani_id" "$_al_title" "$_al_eps" "$_al_next"
         done
 }
 
@@ -1005,12 +1007,16 @@ case "$source" in
         anime_list=$(while read -r ep_no anime_id anime_title; do process_hist_entry & done <"$histfile")
         wait
         _al_watching=$(anilist_get_watching_list 2>/dev/null)
-        [ -n "$_al_watching" ] && anime_list=$(printf "%s\n%s" "$_al_watching" "$anime_list" | sed '/^$/d')
+        # AniList entries win over local history for the same anime_id, otherwise
+        # the id would match two lines and ep_no would come out multi-valued
+        [ -n "$_al_watching" ] && anime_list=$(printf "%s\n%s" "$_al_watching" "$anime_list" | sed '/^$/d' | awk -F'\t' '!seen[$1]++')
         [ -z "$anime_list" ] && die "No unwatched series in history!"
         [ -z "${index##*[!0-9]*}" ] && anime_id=$(printf "%s" "$anime_list" | nl -w 2 | sed 's/^[[:space:]]//' | nth "Select anime: " | cut -f 1)
         [ -z "${index##*[!0-9]*}" ] || anime_id=$(printf "%s" "$anime_list" | sed -n "${index}p" | cut -f 1)
         [ -z "$anime_id" ] && exit 1
-        anime_title=$(printf "%s" "$anime_list" | grep "^$anime_id	" | cut -f 2 | sed 's| - episode.*||')
+        # AniList lines carry an "(N episodes)" suffix that update_history would
+        # otherwise bake into the stored title
+        anime_title=$(printf "%s" "$anime_list" | grep "^$anime_id	" | cut -f 2 | sed -e 's| - episode.*||' -e 's| ([0-9?]* episodes)$||')
         anidb_desc "$anime_id" || true
         episode_maps="$(anidb_episodes "$anime_id")"
         ep_list="$(printf "%s" "$episode_maps" | cut -f 2)"
@@ -1018,6 +1024,14 @@ case "$source" in
         _al_cache="$anilist_cache_dir/id_cache.v5"
         [ -f "$_al_cache" ] && al_media_id=$(grep "^${anime_id}	" "$_al_cache" | head -1 | cut -f2)
         ep_no=$(printf "%s" "$anime_list" | grep "^$anime_id	" | sed -nE 's/.*- episode (.+)$/\1/p')
+        # an AniList-tagged number counts from 1 within the season; anidb numbers
+        # episodes absolutely across the franchise, so read it as a list position
+        case "$ep_no" in
+            *" (AniList)")
+                ep_no=$(printf "%s" "$ep_list" | sed -n "${ep_no% (AniList)}p")
+                [ -z "$ep_no" ] && die "AniList progress is past the last episode anidb lists"
+                ;;
+        esac
         ;;
     *)
         if [ "$menu_program" = "fzf" ]; then
