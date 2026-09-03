@@ -4,13 +4,18 @@
 
 POSIX sh script (v4.14.0). Streams anime via AllAnime API, plays with mpv.exe. Windows-native (MSYS2/Git Bash).
 
-## Sync After Every Change
+## Paths
 
-```sh
-cp ~/ani-cli/ani /c/Users/esteb/scoop/apps/ani-cli/current/ani
-```
+The script lives at `C:\Users\esteb\Documents\ani-cli\ani` and is the only copy.
+`scoop/shims/ani` and `ani.cmd` invoke it by absolute path — there is nothing to sync.
 
-Both files must be kept identical. The live path is what actually runs.
+## Data Home
+
+Config, cache and state live in `ani-cli-data/` beside the script (gitignored).
+`_ani_home()` resolves it from `$0`, so a checkout that carries the directory needs
+no env wiring. `ANI_CLI_CONFIG_DIR` / `ANI_CLI_CACHE_DIR` / `ANI_CLI_HIST_DIR` still
+win when set; they are also set as Windows user env vars, so a shell started before
+they were added falls back to XDG and silently loses the AniList token.
 
 ## Fork Additions (not in upstream)
 
@@ -93,7 +98,7 @@ Token stored at `$anilist_token_file` (chmod 600). Never log, display, or store 
 ## Testing
 
 ```sh
-bash -n ~/ani-cli/ani              # syntax check
+bash -n ./ani                      # syntax check
 ani "classroom of the elite"       # anime smoke test
 ani --manga "berserk"              # manga smoke test
 ani --continue                     # history smoke test

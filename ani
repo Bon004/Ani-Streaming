@@ -859,7 +859,18 @@ if [ ! -t 0 ]; then
     command -v rofi >/dev/null && menu_program=rofi
 fi
 
-hist_dir="${ANI_CLI_HIST_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ani-cli}"
+# fork-local: ani-cli-data/ beside the script is the single home for config,
+# cache and state. It is gitignored, so a fresh checkout that carries it finds
+# the AniList token with no env wiring; without it we fall back to XDG.
+_ani_data_dir=""
+_ani_script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" 2>/dev/null && pwd -P)
+[ -n "$_ani_script_dir" ] && [ -d "$_ani_script_dir/ani-cli-data" ] && _ani_data_dir="$_ani_script_dir/ani-cli-data"
+_ani_home() {
+    [ -n "$_ani_data_dir" ] && printf '%s/%s' "$_ani_data_dir" "$1" && return 0
+    printf '%s' "$2"
+}
+
+hist_dir="${ANI_CLI_HIST_DIR:-$(_ani_home state "${XDG_STATE_HOME:-$HOME/.local/state}/ani-cli")}"
 [ ! -d "$hist_dir" ] && mkdir -p "$hist_dir"
 histfile="$hist_dir/ani-hsts"
 [ ! -f "$histfile" ] && : >"$histfile"
@@ -870,11 +881,11 @@ branch="${ANI_CLI_BRANCH:-master}"
 # ANILIST CONFIG
 # Set ANI_CLI_ANILIST_CLIENT_ID to your AniList client ID (from anilist.co/settings/developer)
 anilist_client_id="${ANI_CLI_ANILIST_CLIENT_ID:-40958}"
-anilist_config_dir="${ANI_CLI_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/ani-cli}"
+anilist_config_dir="${ANI_CLI_CONFIG_DIR:-$(_ani_home config "${XDG_CONFIG_HOME:-$HOME/.config}/ani-cli")}"
 anilist_token_file="$anilist_config_dir/anilist_token"
 anilist_user_id_file="$anilist_config_dir/anilist_user_id"
 # fork-local: upstream has no cache-dir override, only config/hist
-anilist_cache_dir="${ANI_CLI_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/ani-cli}"
+anilist_cache_dir="${ANI_CLI_CACHE_DIR:-$(_ani_home cache "${XDG_CACHE_HOME:-$HOME/.cache}/ani-cli")}"
 anilist_token=""
 al_media_id=""
 latest_ep=""
