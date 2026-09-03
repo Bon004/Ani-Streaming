@@ -386,9 +386,14 @@ anilist_sync_progress() {
     fi
     _status="CURRENT"
     [ -n "$latest_ep" ] && [ "$ep_no" = "$latest_ep" ] && _status="COMPLETED"
-    _mut="{\"query\":\"mutation { SaveMediaListEntry(mediaId: $1, progress: ${ep_no}, status: ${_status}) { id } }\"}"
+    # anidb numbers episodes absolutely across the franchise (S4 ep 10 is "82"),
+    # AniList counts per season — sync the position within this season's list
+    _al_progress="$canon_ep_no"
+    [ -z "$_al_progress" ] && _al_progress=$(printf "%s" "$ep_list" | sed -n "/^${ep_no}$/=")
+    [ -z "$_al_progress" ] && _al_progress="$ep_no"
+    _mut="{\"query\":\"mutation { SaveMediaListEntry(mediaId: $1, progress: ${_al_progress}, status: ${_status}) { id } }\"}"
     _res=$(anilist_query "$_mut" | jq -r '.data.SaveMediaListEntry.id // empty')
-    [ -n "$_res" ] && printf "\033[1;32mAniList synced: ep %s [%s]\033[0m\n" "$ep_no" "$_status" 1>&2
+    [ -n "$_res" ] && printf "\033[1;32mAniList synced: ep %s [%s]\033[0m\n" "$_al_progress" "$_status" 1>&2
 }
 
 anilist_get_watching_list() {
