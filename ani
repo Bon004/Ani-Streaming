@@ -396,6 +396,24 @@ anilist_sync_progress() {
     [ -n "$_res" ] && printf "\033[1;32mAniList synced: ep %s [%s]\033[0m\n" "$_al_progress" "$_status" 1>&2
 }
 
+# keeps the first line per anime id and preserves order, so the AniList
+# entries prepended to the history list win over the local ones
+dedupe_by_id() {
+    _seen_ids=""
+    while IFS= read -r _line; do
+        [ -z "$_line" ] && continue
+        _id="${_line%%	*}"
+        case "$_seen_ids" in
+            *"|${_id}|"*) ;;
+            *)
+                _seen_ids="${_seen_ids}|${_id}|"
+                printf "%s
+" "$_line"
+                ;;
+        esac
+    done
+}
+
 anilist_get_watching_list() {
     [ -z "$anilist_token" ] && return 0
     [ ! -f "$anilist_user_id_file" ] && return 0
@@ -1009,7 +1027,8 @@ case "$source" in
         _al_watching=$(anilist_get_watching_list 2>/dev/null)
         # AniList entries win over local history for the same anime_id, otherwise
         # the id would match two lines and ep_no would come out multi-valued
-        [ -n "$_al_watching" ] && anime_list=$(printf "%s\n%s" "$_al_watching" "$anime_list" | sed '/^$/d' | awk -F'\t' '!seen[$1]++')
+        [ -n "$_al_watching" ] && anime_list=$(printf "%s
+%s" "$_al_watching" "$anime_list" | dedupe_by_id)
         [ -z "$anime_list" ] && die "No unwatched series in history!"
         [ -z "${index##*[!0-9]*}" ] && anime_id=$(printf "%s" "$anime_list" | nl -w 2 | sed 's/^[[:space:]]//' | nth "Select anime: " | cut -f 1)
         [ -z "${index##*[!0-9]*}" ] || anime_id=$(printf "%s" "$anime_list" | sed -n "${index}p" | cut -f 1)
@@ -1031,6 +1050,7 @@ case "$source" in
                 ep_no=$(printf "%s" "$ep_list" | sed -n "${ep_no% (AniList)}p")
                 [ -z "$ep_no" ] && die "AniList progress is past the last episode anidb lists"
                 ;;
+            *) ;;
         esac
         ;;
     *)
