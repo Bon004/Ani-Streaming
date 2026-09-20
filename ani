@@ -262,11 +262,19 @@ megaplay_subtitle() {
 
 # the subtitle hosts check the referer, and mpv only carries one referer (the video's), so the
 # vtt is fetched here and handed to the player as a local file
+# shellcheck disable=SC2086
 fetch_subtitle() {
     [ -z "$sub_link" ] && return 0
     _sub_file="${TMPDIR:-/tmp}/anistream_sub_${ep_no}.vtt"
-    $curl_exe -sL -A "$agent" --max-time 10 $cipher_flag -e "$sub_refr" "$sub_link" -o "$_sub_file" || { sub_link=""; return 0; }
-    grep -q "WEBVTT" "$_sub_file" || { rm -f "$_sub_file"; sub_link=""; return 0; }
+    $curl_exe -sL -A "$agent" --max-time 10 $cipher_flag -e "$sub_refr" "$sub_link" -o "$_sub_file" || {
+        sub_link=""
+        return 0
+    }
+    grep -q "WEBVTT" "$_sub_file" || {
+        rm -f "$_sub_file"
+        sub_link=""
+        return 0
+    }
     sub_link="$(cygpath -w "$_sub_file" 2>/dev/null || printf "%s" "$_sub_file")"
 }
 
