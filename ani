@@ -176,6 +176,7 @@ dep_ch_failover() {
 cleanup() {
     tput sgr0               # clears colors
     rm -f "${histfile}.new" # remove temp logfile
+    rm -f "${TMPDIR:-/tmp}"/anistream_sub_*.vtt
 }
 
 # SCRAPING
@@ -236,13 +237,37 @@ hianime_episodes() {
         sed -nE "s|.*data-number=\"([^\"]*)\".*data-id=\"([0-9]+)\".*/watch/${1}[?]ep=.*|\\2\\t\\1|p"
 }
 
-# picks the english track out of the embed json's subtitles array, then the default one, then the first
+# picks the english track out of the embed json's subtitles array. zokoanime tags every track
+# "lang":"en" and keeps the real language in "label", so only the label is trusted
 pick_subtitle() {
-    _subs="$(printf "%s" "$1" | sed -nE 's|.*"subtitles":\[(.*)\].*|\1|p' | sed 's|},{|}\n{|g')"
-    _pick="$(printf "%s\n" "$_subs" | grep -m 1 '"lang":"en"')"
-    [ -z "$_pick" ] && _pick="$(printf "%s\n" "$_subs" | grep -m 1 '"default":true')"
-    [ -z "$_pick" ] && _pick="$(printf "%s\n" "$_subs" | head -n 1)"
+    _subs="$(printf "%s" "$1" | sed -nE 's|.*"subtitles":\[([^]]*)\].*|\1|p' | sed 's|},{|}\n{|g')"
+    _pick="$(printf "%s\n" "$_subs" | grep -i -m 1 '"label":"English')"
+    [ -z "$_pick" ] && ! printf "%s" "$_subs" | grep -q '"label"' && _pick="$(printf "%s\n" "$_subs" | grep -m 1 '"lang":"en"')"
     printf "%s" "$_pick" | sed -nE 's|.*"src":"([^"]*\.vtt[^"]*)".*|\1|p'
+}
+
+# fallback when the zokoanime embed has no english track: the megaplay embed (HD-2/Vidstream-2)
+# exposes its tracks through getSources. $1 = servers html, $2 = sub/dub. sets sub_link and sub_refr
+megaplay_subtitle() {
+    _hash="$(printf "%s\n" "$1" | sed -nE 's|.*data-type="'"$2"'".*data-server-name="(HD-2\|Vidstream-2)".*data-hash="([^"]*)".*|\2|p' | head -n 1)"
+    _embed="$(b64_decode "$_hash")"
+    [ -z "$_embed" ] && return 1
+    sub_refr="$(printf "%s" "$_embed" | sed -E 's|^(https?://[^/]*).*|\1/|')"
+    _id="$(hianime_curl "$_embed" -e "$base_api/" | sed -nE 's|.*data-id="([0-9]+)".*|\1|p' | head -n 1)"
+    [ -z "$_id" ] && return 1
+    _tracks="$(hianime_curl "${sub_refr}stream/getSources?id=$_id" -e "$_embed" -H "X-Requested-With: XMLHttpRequest" | sed 's|\\/|/|g; s|},{|}\n{|g')"
+    sub_link="$(printf "%s\n" "$_tracks" | grep -i -m 1 '"label":"English' | sed -nE 's|.*"file":"([^"]*\.vtt[^"]*)".*|\1|p')"
+    [ -n "$sub_link" ]
+}
+
+# the subtitle hosts check the referer, and mpv only carries one referer (the video's), so the
+# vtt is fetched here and handed to the player as a local file
+fetch_subtitle() {
+    [ -z "$sub_link" ] && return 0
+    _sub_file="${TMPDIR:-/tmp}/anistream_sub_${ep_no}.vtt"
+    $curl_exe -sL -A "$agent" --max-time 10 $cipher_flag -e "$sub_refr" "$sub_link" -o "$_sub_file" || { sub_link=""; return 0; }
+    grep -q "WEBVTT" "$_sub_file" || { rm -f "$_sub_file"; sub_link=""; return 0; }
+    sub_link="$(cygpath -w "$_sub_file" 2>/dev/null || printf "%s" "$_sub_file")"
 }
 
 # resolves episode $1 in mode $2 (sub/dub): sets links (quality >url per line), sub_link, mal_id and refr
@@ -262,7 +287,9 @@ hianime_m3u8() {
     _json="$(deobfuscate_blob "$_blob")"
     _m3u8_master="$(printf "%s" "$_json" | sed -nE 's|.*"src":"([^"]*\.m3u8[^"]*)".*|\1|p')"
     [ -z "$_m3u8_master" ] && return 1
+    sub_refr="$refr"
     sub_link="$(pick_subtitle "$_json")"
+    [ -z "$sub_link" ] && megaplay_subtitle "$_servers" "$2"
     # quality variants are relative to the master playlist
     links="$(hianime_curl "$_m3u8_master" -e "$refr" | sed 's|^#EXT-X-STREAM.*x||g; s|,.*|p|g; /^#/d; $!N; s|\n| >|;/EXT-X-I-FRAME/d' | sed "\|>https*://|!s|>|>${_m3u8_master%/*}/|" | sort -g -r -s)"
     [ -n "$links" ]
@@ -284,6 +311,7 @@ select_quality() {
 get_video_link() {
     hianime_m3u8 "$ep_no" "$mode" || die "No sources found for $mode!"
     info "hianime.at links fetched"
+    fetch_subtitle
     select_quality "$quality"
     # should never trigger but just in case
     if printf "%s" "$ep_list" | grep -q "^$ep_no$"; then
@@ -769,7 +797,7 @@ manga_main() {
 # shellcheck disable=SC2086
 # $1 = video link, $2 = video name, $3 = extra flags
 download() {
-    [ -n "$sub_link" ] && $curl_exe -sL -A "$agent" --max-time 10 $cipher_flag "$sub_link" -o "$download_dir/$2.vtt"
+    [ -n "$sub_link" ] && cp "$_sub_file" "$download_dir/$2.vtt"
     command -v "yt-dlp" >/dev/null && yt-dlp --referer "$refr" "$1" --no-skip-unavailable-fragments --fragment-retries infinite -N 16 -o "$download_dir/$2.mp4" $3 && return 0
     ffmpeg -extension_picky 0 -referer "$refr" -loglevel error -stats -i "$1" -c copy "$download_dir/$2.mp4" $3
 }
